@@ -1316,7 +1316,7 @@ const func_builtins & value_array_t::get_builtins() const {
             }
             return result;
         }},
-        {"unique", array_unique_not_implemented},
+        {"unique", array_unique},
     };
     return builtins;
 }
