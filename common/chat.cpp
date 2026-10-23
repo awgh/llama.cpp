@@ -1141,7 +1141,7 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
 
     // Ling 3.0 / Bailing V3 - <role>X</role> sections with <arg_key>/<arg_value> tagged
     // tool calls. <role> sections are unique to this family among the tagged-arg templates.
-    if (src.find("<role>ASSISTANT</role>") != std::string::npos &&
+    if (src.find("<tool_call>") != std::string::npos &&
         src.find("<arg_key>") != std::string::npos) {
         LOG_DBG("Using specialized template: Ling 3.0 (Bailing V3)\n");
         return common_chat_params_init_ling3(tmpl, params);
