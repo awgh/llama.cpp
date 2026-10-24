@@ -422,6 +422,7 @@ const func_builtins & global_builtins() {
         {"fromjson", [](const func_args & args) -> value {
             args.ensure_count(1, 1);
             args.ensure_vals<value_string>();
+            const std::string input = args.get_pos(0)->as_string().str();
 
             try {
                 return from_json(
@@ -430,7 +431,9 @@ const func_builtins & global_builtins() {
                 );
             } catch (const std::exception & e) {
                 throw raised_exception(
-                    "fromjson: invalid JSON: " + std::string(e.what())
+                    "fromjson: invalid JSON: " + std::string(e.what()) +
+                    "; input length=" + std::to_string(input.size()) +
+                    "; input tail=" + input.substr(input.size() > 200 ? input.size() - 200 : 0)
                 );
             }
         }},
@@ -689,7 +692,7 @@ const func_builtins & value_string_t::get_builtins() const {
         {"fromjson", [](const func_args & args) -> value {
             args.ensure_count(1, 1);
             args.ensure_vals<value_string>();
-
+            const std::string input = args.get_pos(0)->as_string().str();
             try {
                 return from_json(
                     common_json::parse(args.get_pos(0)->as_string().str()),
@@ -697,7 +700,10 @@ const func_builtins & value_string_t::get_builtins() const {
                 );
             } catch (const std::exception & e) {
                 throw raised_exception(
-                    "fromjson: invalid JSON: " + std::string(e.what())
+                    "fromjson: invalid JSON: " + std::string(e.what()) +
+                    "; input length=" + std::to_string(input.size()) +
+                    "; input tail=" +
+                    input.substr(input.size() > 500 ? input.size() - 500 : 0)
                 );
             }
         }},
