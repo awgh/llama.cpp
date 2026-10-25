@@ -1141,10 +1141,21 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
 
     // Ling 3.0 / Bailing V3 - <role>X</role> sections with <arg_key>/<arg_value> tagged
     // tool calls. <role> sections are unique to this family among the tagged-arg templates.
-    if (src.find("<tool_call>") != std::string::npos &&
+    // GLM templates share <tool_call>/<arg_key> and must not be selected here.
+    if (src.find("<role>ASSISTANT</role>") != std::string::npos &&
         src.find("<arg_key>") != std::string::npos) {
         LOG_DBG("Using specialized template: Ling 3.0 (Bailing V3)\n");
         return common_chat_params_init_ling3(tmpl, params);
+    }
+
+    // GLM-5.3-Flash uses the same <tool_call>/<arg_key>/<arg_value> tags as GLM-4.7,
+    // but the differential autoparser leaves a call that arrives before </think> in
+    // content. effective_reasoning_effort is unique to this template.
+    if (src.find("effective_reasoning_effort") != std::string::npos &&
+        src.find("<tool_call>") != std::string::npos &&
+        src.find("<arg_key>") != std::string::npos) {
+        LOG_DBG("Using specialized template: GLM-5.3-Flash\n");
+        return common_chat_params_init_glm53(tmpl, params);
     }
 
     // Cohere2 MoE / North Code - marker-wrapped format with <|START_TEXT|> content and
@@ -1523,6 +1534,21 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     }
 
     if (!is_partial) {
+        // Lenient parsing can surface a tool call whose arguments stopped mid-string.
+        // A finished response must not carry that into the next turn.
+        for (const auto & tc : msg.tool_calls) {
+            if (tc.arguments.empty()) {
+                continue;
+            }
+            try {
+                auto parsed = json::parse(tc.arguments);
+                if (!parsed.is_object()) {
+                    throw std::runtime_error("not an object");
+                }
+            } catch (const std::exception &) {
+                throw std::runtime_error("tool call arguments are not valid JSON");
+            }
+        }
         LOG_DBG("Parsed message: %s\n", common_chat_msgs_to_json_oaicompat({ msg }).at(0).dump().c_str());
     }
     return msg;

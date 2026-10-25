@@ -4627,12 +4627,14 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             // will be offset by generation_prompt.size() into effective_input space.
             assert(!pp.generation_prompt.empty());
 
+            // An unknown argument is rejected. A trailing newline is only spacing and
+            // does not reach the parse-error path.
             std::string bad_input =
                 "Thinking.\n"
                 "</think>"
                 "<tool_call>get_weather"
-                "<arg_key>city</arg_key><arg_value>Tokyo</arg_value>"
-                "</tool_call>\n";
+                "<arg_key>no_such_arg</arg_key><arg_value>Tokyo</arg_value>"
+                "</tool_call>";
 
             bool got_runtime_error = false;
             bool got_out_of_range = false;
@@ -4648,6 +4650,320 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             }
             GGML_ASSERT(!got_out_of_range && "throw path crashed with out_of_range (input.substr in effective_input space)");
             GGML_ASSERT(got_runtime_error  && "throw path should produce std::runtime_error with parse position");
+        }
+    }
+
+    // GLM-5.3-Flash. Same tagged calls as GLM-4.7, but the generation prompt always
+    // opens <think>, and prior tool calls may arrive as objects or JSON strings.
+    {
+        static common_chat_tool read_file_tool{
+            "read_file", "Read a file",
+            R"({"type":"object","properties":{"filepath":{"type":"string"}},"required":["filepath"]})",
+        };
+
+        const std::string template_path = "models/templates/GLM-5.3-Flash.jinja";
+        bool run_glm53 = g_template_filter.empty();
+        if (!run_glm53) {
+            std::string path_l = template_path;
+            std::string filt_l = g_template_filter;
+            std::transform(path_l.begin(), path_l.end(), path_l.begin(), ::tolower);
+            std::transform(filt_l.begin(), filt_l.end(), filt_l.begin(), ::tolower);
+            run_glm53 = path_l.find(filt_l) != std::string::npos;
+        }
+        if (run_glm53) {
+        auto tmpls = read_templates(template_path);
+        auto caps  = common_chat_templates_get_caps(tmpls.get());
+        if (!caps["supports_tool_calls"] || !caps["supports_parallel_tool_calls"] || !caps["supports_object_arguments"]) {
+            throw std::runtime_error(
+                "GLM-5.3-Flash caps missing tool support: tool_calls=" +
+                std::to_string(caps["supports_tool_calls"]) +
+                " parallel=" + std::to_string(caps["supports_parallel_tool_calls"]) +
+                " object_arguments=" + std::to_string(caps["supports_object_arguments"]));
+        }
+
+        auto render = [&](const std::vector<common_chat_msg> & messages, bool add_generation_prompt) {
+            common_chat_templates_inputs inputs;
+            inputs.messages              = messages;
+            inputs.tools                 = { read_file_tool };
+            inputs.use_jinja             = true;
+            inputs.add_generation_prompt = add_generation_prompt;
+            inputs.parallel_tool_calls   = true;
+            return common_chat_templates_apply(tmpls.get(), inputs).prompt;
+        };
+        auto render_arguments = [&](const json & arguments) {
+            jinja::lexer lexer;
+            auto prog = jinja::parse_from_tokens(lexer.tokenize(read_file(template_path)));
+            json messages = json::array({
+                { {"role", "user"}, {"content", "read n2.c"} },
+                { {"role", "assistant"}, {"content", ""}, {"reasoning_content", "looking"},
+                  {"tool_calls", json::array({
+                      { {"id", "call-n2"}, {"type", "function"},
+                        {"function", { {"name", "read_file"}, {"arguments", arguments} } } }
+                  })} }
+            });
+            jinja::context ctx;
+            jinja::global_from_json(ctx, json{
+                {"messages", messages},
+                {"tools", common_chat_tools_to_json_oaicompat({ read_file_tool })},
+                {"add_generation_prompt", false},
+                {"bos_token", ""},
+                {"eos_token", ""},
+            }, true);
+            jinja::runtime runtime(ctx);
+            return jinja::runtime::gather_string_parts(runtime.execute(prog))->as_string().str();
+        };
+        auto tool_call_text = [](const std::string & prompt) {
+            const std::string marker = "<tool_call>read_file";
+            const auto start = prompt.rfind(marker);
+            const auto end   = start == std::string::npos ? std::string::npos : prompt.find("</tool_call>", start);
+            if (start == std::string::npos || end == std::string::npos) {
+                throw std::runtime_error("rendered prompt has no read_file call:\n" + prompt);
+            }
+            return prompt.substr(start, end + std::string("</tool_call>").size() - start);
+        };
+
+        common_chat_msg user;
+        user.role    = "user";
+        user.content = "read n2.c";
+
+        const std::string expected_call = "<tool_call>read_file<arg_key>filepath</arg_key><arg_value>n2.c</arg_value></tool_call>";
+        const std::string from_string = tool_call_text(render_arguments(R"({"filepath":"n2.c"})"));
+        const std::string from_object = tool_call_text(render_arguments(json{{"filepath", "n2.c"}}));
+        const std::string from_apply  = tool_call_text(render({ user, simple_assist_msg("", "looking", "read_file", R"({"filepath":"n2.c"})") }, false));
+        if (from_string != expected_call || from_object != expected_call || from_apply != expected_call) {
+            throw std::runtime_error("argument replay mismatch:\nstring: " + from_string + "\nobject: " + from_object + "\napply: " + from_apply);
+        }
+
+        {
+            common_chat_msg bad = simple_assist_msg("", "", "read_file", R"({"filepath": "n2.c)");
+            bool threw = false;
+            std::string what;
+            try {
+                render({ user, bad }, false);
+            } catch (const std::exception & e) {
+                threw = true;
+                what  = e.what();
+            }
+            if (!threw || what.find("JSON") == std::string::npos) {
+                throw std::runtime_error("malformed tool arguments should fail JSON parsing, got: " + what);
+            }
+        }
+
+        common_chat_msg prior;
+        prior.role = "assistant";
+        prior.reasoning_content = "checking two files";
+        prior.tool_calls = {
+            { "read_file", R"({"filepath":"n2.c"})", "call-n2" },
+            { "read_file", R"({"filepath":"n4.c"})", "call-n4" },
+        };
+        common_chat_msg result_n2;
+        result_n2.role         = "tool";
+        result_n2.tool_call_id = "call-n2";
+        result_n2.content      = "int n2;";
+        common_chat_msg result_n4;
+        result_n4.role         = "tool";
+        result_n4.tool_call_id = "call-n4";
+        result_n4.content      = "int n4;";
+        const std::string replayed = render({ user, prior, result_n2, result_n4 }, true);
+        const auto n2_pos = replayed.find("<tool_call>read_file<arg_key>filepath</arg_key><arg_value>n2.c</arg_value></tool_call>");
+        const auto n4_pos = replayed.find("<tool_call>read_file<arg_key>filepath</arg_key><arg_value>n4.c</arg_value></tool_call>");
+        const auto r2_pos = replayed.find("<tool_response>int n2;</tool_response>");
+        const auto r4_pos = replayed.find("<tool_response>int n4;</tool_response>");
+        if (n2_pos == std::string::npos || n4_pos == std::string::npos || n2_pos > n4_pos ||
+            r2_pos == std::string::npos || r4_pos == std::string::npos || r2_pos > r4_pos || n4_pos > r2_pos) {
+            throw std::runtime_error("multi-turn tool replay is out of order:\n" + replayed);
+        }
+
+        auto tst = peg_tester(template_path, detailed_debug);
+        const bool parallel = caps["supports_parallel_tool_calls"];
+
+        tst.test("</think>Hello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ read_file_tool })
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+
+        tst.test("I'm\nthinking</think>Hello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist_thoughts)
+            .run();
+
+        // The reported Continue leak: this exact call must be structured, not left in content.
+        tst.test("<tool_call>read_file<arg_key>filepath</arg_key><arg_value>n2.c</arg_value></tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ read_file_tool })
+            .expect_tool_calls({ { "read_file", R"({"filepath":"n2.c"})", "" } })
+            .run();
+
+        tst.test(
+               "I'm\nthinking</think>"
+               "Checking n2.c."
+               "<tool_call>read_file<arg_key>filepath</arg_key><arg_value>n2.c</arg_value></tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ read_file_tool })
+            .expect_reasoning("I'm\nthinking")
+            .expect_content("Checking n2.c.")
+            .expect_tool_calls({ { "read_file", R"({"filepath":"n2.c"})", "" } })
+            .run();
+
+        // A call can arrive before the forced-open think block is closed.
+        tst.test(
+               "I'm\nthinking"
+               "<tool_call>read_file<arg_key>filepath</arg_key><arg_value>n2.c</arg_value></tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ read_file_tool })
+            .expect_reasoning("I'm\nthinking")
+            .expect_tool_calls({ { "read_file", R"({"filepath":"n2.c"})", "" } })
+            .run();
+
+        tst.test(
+               "<tool_call>special_function"
+               "<arg_key>arg1</arg_key><arg_value>1</arg_value>"
+               "</tool_call>"
+               "<tool_call>special_function_with_opt"
+               "<arg_key>arg1</arg_key><arg_value>1</arg_value>"
+               "<arg_key>arg2</arg_key><arg_value>2</arg_value>"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .parallel_tool_calls(parallel)
+            .tools({ special_function_tool, special_function_tool_with_optional_param })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
+            })
+            .run();
+
+        tst.test(
+               "<tool_call>read_file"
+               "<arg_key>filepath</arg_key><arg_value>n2.c</arg_value>"
+               "</tool_call>"
+               "<tool_call>read_file"
+               "<arg_key>filepath</arg_key><arg_value>n4.c</arg_value>"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .parallel_tool_calls(false)
+            .tools({ read_file_tool })
+            .expect_tool_calls({
+                { "read_file", R"({"filepath":"n2.c"})", "" },
+                { "read_file", R"({"filepath":"n4.c"})", "" },
+            })
+            .run();
+
+        tst.test(
+               "Preparing updates."
+               "<tool_call>magic"
+               "<arg_key>name</arg_key><arg_value>say \"hi\"\nC:\\temp 上海</arg_value>"
+               "<arg_key>ref</arg_key><arg_value>id</arg_value>"
+               "</tool_call>"
+               "<tool_call>magic_int"
+               "<arg_key>ref</arg_key><arg_value>42</arg_value>"
+               "<arg_key>name</arg_key><arg_value>上海</arg_value>"
+               "</tool_call>"
+               "<tool_call>amount"
+               "<arg_key>orig</arg_key><arg_value>2.5</arg_value>"
+               "</tool_call>"
+               "<tool_call>toggle"
+               "<arg_key>enabled</arg_key><arg_value>true</arg_value>"
+               "</tool_call>"
+               "<tool_call>set_config"
+               "<arg_key>config</arg_key><arg_value>{\"source\": \"spark\", \"options\": {\"strict\": true}}</arg_value>"
+               "</tool_call>"
+               "<tool_call>nested_args"
+               "<arg_key>tags</arg_key><arg_value>[\"alpha\", \"测试\"]</arg_value>"
+               "<arg_key>entries</arg_key><arg_value>[{\"id\": 1, \"label\": \"first\"}, {\"id\": 2, \"label\": \"第二\"}]</arg_value>"
+               "</tool_call>"
+               "<tool_call>empty_args"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .parallel_tool_calls(parallel)
+            .tools({ magic_tool, magic_int_tool, amount_tool, toggle_tool, config_tool, nested_args_tool, empty_args_tool })
+            .expect_reasoning("Preparing updates.")
+            .expect_tool_calls({
+                { "magic", "{\"name\":\"say \\\"hi\\\"\\nC:\\\\temp 上海\",\"ref\":\"id\"}", {} },
+                { "magic_int", R"({"ref": 42, "name": "上海"})", {} },
+                { "amount", R"({"orig": 2.5})", {} },
+                { "toggle", R"({"enabled": true})", {} },
+                { "set_config", R"({"config": {"source": "spark", "options": {"strict": true}}})", {} },
+                { "nested_args", R"({"tags": ["alpha", "测试"], "entries": [{"id": 1, "label": "first"}, {"id": 2, "label": "第二"}]})", {} },
+                { "empty_args", "{}", {} },
+            })
+            .run();
+
+        // Required arguments are accepted in either order.
+        tst.test(
+               "<tool_call>magic"
+               "<arg_key>ref</arg_key><arg_value>later</arg_value>"
+               "<arg_key>name</arg_key><arg_value>first</arg_value>"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ magic_tool })
+            .expect_tool_calls({ { "magic", R"({"ref":"later","name":"first"})", "" } })
+            .run();
+
+        tst.test("</think>Both files define ints.")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ read_file_tool })
+            .messages({ user, prior, result_n2, result_n4 })
+            .expect_content("Both files define ints.")
+            .run();
+
+        tst.test(
+               "</think>"
+               "<tool_call>read_file<arg_key>filepath</arg_key><arg_value>fs1.c</arg_value></tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ read_file_tool })
+            .messages({ user, prior, result_n2, result_n4 })
+            .expect_tool_calls({ { "read_file", R"({"filepath":"fs1.c"})", "" } })
+            .run();
+
+        // A finished truncated call must not be returned as a tool call.
+        {
+            if (g_template_filter.empty() || template_path.find(g_template_filter) != std::string::npos) {
+                common_chat_templates_inputs inputs;
+                inputs.tools            = { read_file_tool };
+                inputs.messages         = { message_user };
+                inputs.use_jinja        = true;
+                inputs.enable_thinking  = true;
+                inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+                auto params = common_chat_templates_apply(tmpls.get(), inputs);
+                common_peg_arena arena;
+                arena.load(params.parser);
+                common_chat_parser_params pp(params);
+                const std::string truncated =
+                    "<tool_call>read_file<arg_key>filepath</arg_key><arg_value>n2.c";
+                try {
+                    common_chat_peg_parse(arena, truncated, /*is_partial=*/true, pp);
+                } catch (const std::exception & e) {
+                    throw std::runtime_error(std::string("partial truncated tool call threw: ") + e.what());
+                }
+                bool committed = false;
+                std::string committed_args;
+                try {
+                    auto full = common_chat_peg_parse(arena, truncated, /*is_partial=*/false, pp);
+                    committed = !full.tool_calls.empty();
+                    if (committed) {
+                        committed_args = full.tool_calls[0].name + " " + full.tool_calls[0].arguments +
+                                         " content=[" + full.content + "] reasoning=[" + full.reasoning_content + "]";
+                    }
+                } catch (const std::exception &) {
+                    committed = false;
+                }
+                if (committed) {
+                    throw std::runtime_error("truncated tool call was committed: " + committed_args);
+                }
+            }
+        }
         }
     }
 

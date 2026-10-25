@@ -412,30 +412,29 @@ static value toobject(const func_args & args) {
 
 static value from_json(const common_json & j, bool mark_input);
 
+// |fromjson is the Jinja filter. A global fromjson() would duplicate it and is unused.
+static value fromjson_filter(const func_args & args) {
+    args.ensure_count(1, 1);
+    args.ensure_vals<value_string>();
+    const std::string input = args.get_pos(0)->as_string().str();
+    try {
+        return from_json(common_json::parse(input), true);
+    } catch (const std::exception & e) {
+        const size_t tail = input.size() > 200 ? input.size() - 200 : 0;
+        throw raised_exception(
+            "fromjson: invalid JSON: " + std::string(e.what()) +
+            "; input length=" + std::to_string(input.size()) +
+            "; input tail=" + input.substr(tail)
+        );
+    }
+}
+
 const func_builtins & global_builtins() {
     static const func_builtins builtins = {
         {"raise_exception", [](const func_args & args) -> value {
             args.ensure_vals<value_string>();
             std::string msg = args.get_pos(0)->as_string().str();
             throw raised_exception("Jinja Exception: " + msg);
-        }},
-        {"fromjson", [](const func_args & args) -> value {
-            args.ensure_count(1, 1);
-            args.ensure_vals<value_string>();
-            const std::string input = args.get_pos(0)->as_string().str();
-
-            try {
-                return from_json(
-                    common_json::parse(args.get_pos(0)->as_string().str()),
-                    true
-                );
-            } catch (const std::exception & e) {
-                throw raised_exception(
-                    "fromjson: invalid JSON: " + std::string(e.what()) +
-                    "; input length=" + std::to_string(input.size()) +
-                    "; input tail=" + input.substr(input.size() > 200 ? input.size() - 200 : 0)
-                );
-            }
         }},
         {"dict", toobject},
         {"namespace", toobject},
@@ -689,24 +688,7 @@ static bool string_endswith(const std::string & str, const std::string & suffix)
 const func_builtins & value_string_t::get_builtins() const {
     static const func_builtins builtins = {
         {"default", default_value},
-        {"fromjson", [](const func_args & args) -> value {
-            args.ensure_count(1, 1);
-            args.ensure_vals<value_string>();
-            const std::string input = args.get_pos(0)->as_string().str();
-            try {
-                return from_json(
-                    common_json::parse(args.get_pos(0)->as_string().str()),
-                    true
-                );
-            } catch (const std::exception & e) {
-                throw raised_exception(
-                    "fromjson: invalid JSON: " + std::string(e.what()) +
-                    "; input length=" + std::to_string(input.size()) +
-                    "; input tail=" +
-                    input.substr(input.size() > 500 ? input.size() - 500 : 0)
-                );
-            }
-        }},
+        {"fromjson", fromjson_filter},
         {"upper", [](const func_args & args) -> value {
             args.ensure_vals<value_string>();
             jinja::string str = args.get_pos(0)->as_string().uppercase();
